@@ -5,13 +5,17 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <limits.h>
 
 #define BUFFER_SIZE 4096
 
+
 // Function prototypes
 int validate_root_directory(const char *root_path);
-void build_file_path(const char *root, const char *req_path, char *file_path, size_t max_len);
+int build_file_path(const char *root, const char *req_path, char *file_path, size_t max_len);
 int send_file(int socket, const char *file_path, const char *req_path);
+int is_directory(const char *path);
+void normalize_path(char *path);
 void send_404(int socket, const char *path);
 const char* get_mime_type(const char *path);
 
@@ -23,7 +27,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    int port = atoi(argv[1]);
+    int port = atoi(argv[1]); // Convert port argument to integer
     const char *root_dir = argv[2];
 
     // Validate root directory
@@ -165,21 +169,58 @@ int validate_root_directory(const char *root_path) {
     }
     return S_ISDIR(path_stat.st_mode); // Check if it's a directory
 }
+int is_directory(const char *path) {
+    struct stat path_stat;
+    if (stat(path, &path_stat) != 0) {
+        return 0;
+    }
+    return S_ISDIR(path_stat.st_mode);
+}
+
 
 // Build full file path from root and request path
-void build_file_path(const char *root, const char *req_path, char *file_path, size_t max_len) {
-    // Start with root directory
-    snprintf(file_path, max_len, "%s", root);
+int build_file_path(const char *root, const char *req_path, char *file_path, size_t max_len) {
+    // Start with root directory (without trailing slash)
+    size_t root_len = strlen(root);
+    char root_clean[4096];
+    strncpy(root_clean, root, sizeof(root_clean) - 1);
+    root_clean[sizeof(root_clean) - 1] = '\0';
     
-    // If path is "/", serve index.html
-    if (strcmp(req_path, "/") == 0) {
-        snprintf(file_path, max_len, "%s/index.html", root);
-    } else {
-        // Append requested path
-        snprintf(file_path, max_len, "%s%s", root, req_path);
+    // Remove trailing slash from root if present
+    if (root_len > 0 && root_clean[root_len - 1] == '/') {
+        root_clean[root_len - 1] = '\0';
     }
     
-    printf("Mapped path: '%s' -> '%s'\n", req_path, file_path);
+    // Build the full path
+    if (strcmp(req_path, "/") == 0) {
+        // Root path - try index.html
+        snprintf(file_path, max_len, "%s/index.html", root_clean);
+    } else {
+        // Construct path: root + requested path
+        snprintf(file_path, max_len, "%s%s", root_clean, req_path);
+        
+        // Check if this path is a directory
+         if (is_directory(file_path)) {
+            // If it's a directory, append /index.html
+            size_t current_len = strlen(file_path);
+            
+            // Remove trailing slash if present before appending index.html
+            if (current_len > 0 && file_path[current_len - 1] == '/') {
+                file_path[current_len - 1] = '\0';
+                current_len--;
+            }
+            
+            // Use a temporary buffer to avoid overwriting while reading
+            char temp_path[4096];
+            strncpy(temp_path, file_path, sizeof(temp_path) - 1);
+            temp_path[sizeof(temp_path) - 1] = '\0';
+            
+            snprintf(file_path, max_len, "%s/index.html", temp_path);
+            printf("Directory detected, serving: %s\n", file_path);
+        }
+    }
+    
+    return 1;
 }
 
 // Get MIME type based on file extension
@@ -204,6 +245,36 @@ const char* get_mime_type(const char *path) {
     
     return "application/octet-stream";
 }
+
+void normalize_path(char *path) {
+    if (!path || strlen(path) == 0) return;
+    
+    // Remove duplicate slashes
+    char *src = path;
+    char *dst = path;
+    int last_was_slash = 0;
+    
+    while (*src) {
+        if (*src == '/') {
+            if (!last_was_slash) {
+                *dst++ = *src;
+                last_was_slash = 1;
+            }
+        } else {
+            *dst++ = *src;
+            last_was_slash = 0;
+        }
+        src++;
+    }
+    *dst = '\0';
+    
+    // Ensure path starts with '/'
+    if (path[0] != '/') {
+        memmove(path + 1, path, strlen(path) + 1);
+        path[0] = '/';
+    }
+}
+
 
 // Send file contents to client
 int send_file(int socket, const char *file_path, const char *req_path) {
