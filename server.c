@@ -11,7 +11,7 @@
 #include <limits.h>
 #include <ctype.h>
 #include <errno.h>
-
+#include <time.h>
 #define BUFFER_SIZE 4096
 
 // Function prototypes
@@ -29,9 +29,14 @@ int contains_path_traversal(const char *path);
 int is_file_readable(const char *path);
 void strip_query_and_fragment(char *url);
 int validate_url_characters(const char *url);
-void handle_client(int client_socket, const char *root_dir);
+void handle_client(int client_socket, const char *root_dir, struct sockaddr_in client_addr);
 void setup_signal_handler(void);
 void sigchld_handler(int sig);
+void sigint_handler(int sig);       // 🆕 New SIGINT handler
+void log_request(const char *client_ip, const char *path, int status_code); // 🆕 Log helper
+
+int serverSocket = -1;
+FILE *log_file = NULL;
 
 int main(int argc, char *argv[]) {
     // Check command line arguments
@@ -51,8 +56,26 @@ int main(int argc, char *argv[]) {
     }
     printf("Serving files from: %s\n", root_dir);
 
+    log_file = fopen("server.log", "a");
+    if (!log_file) {
+        perror("Failed to open log file");
+        exit(1);
+    }
+
+
     // Setup signal handler for child processes
     setup_signal_handler();
+
+    // 🆕 Set up SIGINT for graceful shutdown
+    struct sigaction sa_int;
+    sa_int.sa_handler = sigint_handler;
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = 0;
+    if (sigaction(SIGINT, &sa_int, NULL) == -1) {
+        perror("sigaction SIGINT failed");
+        exit(1);
+    }
+
 
     // Socket setup
     int serverSocket;
@@ -131,7 +154,7 @@ int main(int argc, char *argv[]) {
             close(serverSocket);
             
             // Handle the client request
-            handle_client(newSocket, root_dir);
+            handle_client(newSocket, root_dir, clientAddr);
             
             // Close client socket
             close(newSocket);
@@ -170,6 +193,21 @@ void setup_signal_handler(void) {
     printf("Signal handler for SIGCHLD installed.\n");
 }
 
+// SIGINT handler for graceful shutdown
+void sigint_handler(int sig) {
+    printf("\n[SERVER] Caught SIGINT (Ctrl+C). Shutting down gracefully...\n");
+    if (serverSocket != -1) {
+        close(serverSocket);
+        printf("[SERVER] Socket closed.\n");
+    }
+    if (log_file) {
+        fclose(log_file);
+        printf("[SERVER] Log file closed.\n");
+    }
+    exit(0);
+}
+
+
 // Signal handler to reap zombie processes
 void sigchld_handler(int sig) {
     // Save errno to restore it later (good practice in signal handlers)
@@ -193,8 +231,27 @@ void sigchld_handler(int sig) {
     errno = saved_errno;
 }
 
+// 🆕 Logging function
+void log_request(const char *client_ip, const char *path, int status_code) {
+    if (!log_file) return;
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_buf[64];
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    fprintf(log_file, "[%s] %s \"%s\" %d\n", time_buf, client_ip, path, status_code);
+    fflush(log_file);
+}
+
 // Handle individual client request (runs in child process)
-void handle_client(int client_socket, const char *root_dir) {
+void handle_client(int client_socket, const char *root_dir, struct sockaddr_in client_addr) {
+
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+
+    int status_code = 200;
+
     // Receive HTTP request
     char req_buf[BUFFER_SIZE];
     ssize_t rlen = recv(client_socket, req_buf, sizeof(req_buf) - 1, 0);
@@ -223,6 +280,7 @@ void handle_client(int client_socket, const char *root_dir) {
     } else {
         printf("[CHILD PID=%d] No request line found.\n", getpid());
         send_400(client_socket);
+        log_request(client_ip, "(invalid request)", 400); 
         return;
     }
 
@@ -232,6 +290,7 @@ void handle_client(int client_socket, const char *root_dir) {
     
     if (scanned != 3) {
         send_400(client_socket);
+        log_request(client_ip, "(invalid request)", 400); 
         return;
     }
 
@@ -246,6 +305,7 @@ void handle_client(int client_socket, const char *root_dir) {
                               "<html><body><h1>501 Not Implemented</h1>"
                               "<p>Method not supported.</p></body></html>";
         send(client_socket, not_impl, strlen(not_impl), 0);
+        log_request(client_ip, path, 501);
         printf("[CHILD PID=%d] Sent 501 Not Implemented (method %s)\n", getpid(), method);
         return;
     }
@@ -257,6 +317,7 @@ void handle_client(int client_socket, const char *root_dir) {
     if (!sanitize_result) {
         printf("[CHILD PID=%d] URL failed sanitization: %s\n", getpid(), path);
         send_400(client_socket);
+        log_request(client_ip, path, 400);
         return;
     }
 
@@ -274,15 +335,21 @@ void handle_client(int client_socket, const char *root_dir) {
         struct stat st;
         if (stat(file_path, &st) == 0) {
             send_403(client_socket, path);
+            status_code = 403;
         } else {
             send_404(client_socket, path);
+            status_code = 404;
         }
+        log_request(client_ip, path, status_code);
         return;
     }
 
     // Send the file
     if (!send_file(client_socket, file_path, path)) {
         send_404(client_socket, path);
+        log_request(client_ip, path, 404);
+    } else {
+        log_request(client_ip, path, 200);
     }
 }
 
