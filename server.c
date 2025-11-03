@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,8 +6,11 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <limits.h>
 #include <ctype.h>
+#include <errno.h>
 
 #define BUFFER_SIZE 4096
 
@@ -25,6 +29,9 @@ int contains_path_traversal(const char *path);
 int is_file_readable(const char *path);
 void strip_query_and_fragment(char *url);
 int validate_url_characters(const char *url);
+void handle_client(int client_socket, const char *root_dir);
+void setup_signal_handler(void);
+void sigchld_handler(int sig);
 
 int main(int argc, char *argv[]) {
     // Check command line arguments
@@ -44,8 +51,11 @@ int main(int argc, char *argv[]) {
     }
     printf("Serving files from: %s\n", root_dir);
 
+    // Setup signal handler for child processes
+    setup_signal_handler();
+
     // Socket setup
-    int serverSocket, newSocket;
+    int serverSocket;
     struct sockaddr_in serverAddr, clientAddr;
     socklen_t addr_size;
 
@@ -56,6 +66,14 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     printf("Socket created successfully.\n");
+
+    // Set socket option to reuse address
+    int opt = 1;
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt failed");
+        close(serverSocket);
+        exit(1);
+    }
 
     // Set up server address
     serverAddr.sin_family = AF_INET;
@@ -78,123 +96,194 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    // Main server loop
+    // Main server loop - Parent process accepts connections
     while (1) {
         // Accept client connection
         addr_size = sizeof(clientAddr);
-        newSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &addr_size);
+        int newSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &addr_size);
         if (newSocket < 0) {
+            if (errno == EINTR) {
+                // Interrupted by signal, continue accepting
+                continue;
+            }
             perror("Accept failed");
             continue;
         }
-        printf("\n=== Client connected from %s:%d ===\n",
-               inet_ntoa(clientAddr.sin_addr), ntohs(clientAddr.sin_port));
 
-        // Receive HTTP request
-        char req_buf[BUFFER_SIZE];
-        ssize_t rlen = recv(newSocket, req_buf, sizeof(req_buf) - 1, 0);
-        if (rlen < 0) {
-            perror("recv failed");
-            close(newSocket);
-            continue;
-        } else if (rlen == 0) {
-            printf("Client closed connection\n");
-            close(newSocket);
-            continue;
-        }
+        printf("\n[PARENT PID=%d] Client connected from %s:%d (socket=%d)\n",
+               getpid(), inet_ntoa(clientAddr.sin_addr), 
+               ntohs(clientAddr.sin_port), newSocket);
 
-        req_buf[rlen] = '\0';
-        printf("Received %zd bytes\n", rlen);
+        // Fork a child process to handle the client
+        pid_t pid = fork();
 
-        // Extract request line
-        char request_line[1024];
-        char *line_end = strstr(req_buf, "\r\n");
-        if (!line_end) line_end = strstr(req_buf, "\n");
-        
-        if (line_end) {
-            size_t line_len = line_end - req_buf;
-            if (line_len >= sizeof(request_line)) 
-                line_len = sizeof(request_line) - 1;
-            strncpy(request_line, req_buf, line_len);
-            request_line[line_len] = '\0';
-        } else {
-            printf("No request line found.\n");
-            send_400(newSocket);
+        if (pid < 0) {
+            // Fork failed
+            perror("Fork failed");
             close(newSocket);
             continue;
         }
-
-        // Parse request line
-        char method[16], path[1024], version[16];
-        int scanned = sscanf(request_line, "%15s %1023s %15s", method, path, version);
-        
-        if (scanned != 3) {
-            send_400(newSocket);
-            close(newSocket);
-            continue;
-        }
-
-        printf("Request: %s %s %s\n", method, path, version);
-
-        // Only handle GET requests
-        if (strcmp(method, "GET") != 0) {
-            const char *not_impl = "HTTP/1.1 501 Not Implemented\r\n"
-                                  "Content-Type: text/html\r\n"
-                                  "Content-Length: 70\r\n"
-                                  "Connection: close\r\n\r\n"
-                                  "<html><body><h1>501 Not Implemented</h1>"
-                                  "<p>Method not supported.</p></body></html>";
-            send(newSocket, not_impl, strlen(not_impl), 0);
-            printf("Sent 501 Not Implemented (method %s)\n", method);
-            close(newSocket);
-            continue;
-        }
-
-        // Sanitize URL (strips query/fragment, validates characters, checks traversal)
-        int sanitize_result = sanitize_url(path);
-        printf("Sanitize result: %d\n", sanitize_result);
-        
-        if (!sanitize_result) {
-            printf("URL failed sanitization: %s\n", path);
-            send_400(newSocket);
-            close(newSocket);
-            continue;
-        }
-
-        printf("Sanitized path: %s\n", path);
-
-        // Build file path
-        char file_path[2048];
-        build_file_path(root_dir, path, file_path, sizeof(file_path));
-        
-        // Check if file is readable
-        if (!is_file_readable(file_path)) {
-            printf("File not readable or not found: %s\n", file_path);
+        else if (pid == 0) {
+            // ============ CHILD PROCESS ============
+            printf("[CHILD PID=%d] Handling client request\n", getpid());
             
-            // Determine if it's 403 or 404
-            struct stat st;
-            if (stat(file_path, &st) == 0) {
-                // File exists but not readable
-                send_403(newSocket, path);
-            } else {
-                // File doesn't exist
-                send_404(newSocket, path);
-            }
+            // Child doesn't need the listening socket
+            close(serverSocket);
+            
+            // Handle the client request
+            handle_client(newSocket, root_dir);
+            
+            // Close client socket
             close(newSocket);
-            continue;
+            printf("[CHILD PID=%d] Request handled, exiting\n", getpid());
+            
+            // Exit child process
+            exit(0);
         }
-
-        // Send the file
-        if (!send_file(newSocket, file_path, path)) {
-            send_404(newSocket, path);
+        else {
+            // ============ PARENT PROCESS ============
+            printf("[PARENT PID=%d] Forked child process PID=%d\n", getpid(), pid);
+            
+            // Parent doesn't need the client socket
+            close(newSocket);
+            
+            // Parent continues to accept more connections
+            printf("[PARENT PID=%d] Ready to accept next connection\n", getpid());
         }
-
-        close(newSocket);
-        printf("=== Connection closed ===\n");
     }
 
     close(serverSocket);
     return 0;
+}
+
+// Setup signal handler for SIGCHLD
+void setup_signal_handler(void) {
+    struct sigaction sa;
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+        perror("sigaction failed");
+        exit(1);
+    }
+    printf("Signal handler for SIGCHLD installed.\n");
+}
+
+// Signal handler to reap zombie processes
+void sigchld_handler(int sig) {
+    // Save errno to restore it later (good practice in signal handlers)
+    int saved_errno = errno;
+    
+    // Reap all terminated child processes
+    pid_t pid;
+    int status;
+    
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (WIFEXITED(status)) {
+            printf("[SIGNAL HANDLER] Child process PID=%d exited with status %d\n", 
+                   pid, WEXITSTATUS(status));
+        } else if (WIFSIGNALED(status)) {
+            printf("[SIGNAL HANDLER] Child process PID=%d killed by signal %d\n", 
+                   pid, WTERMSIG(status));
+        }
+    }
+    
+    // Restore errno
+    errno = saved_errno;
+}
+
+// Handle individual client request (runs in child process)
+void handle_client(int client_socket, const char *root_dir) {
+    // Receive HTTP request
+    char req_buf[BUFFER_SIZE];
+    ssize_t rlen = recv(client_socket, req_buf, sizeof(req_buf) - 1, 0);
+    if (rlen < 0) {
+        perror("recv failed");
+        return;
+    } else if (rlen == 0) {
+        printf("[CHILD PID=%d] Client closed connection\n", getpid());
+        return;
+    }
+
+    req_buf[rlen] = '\0';
+    printf("[CHILD PID=%d] Received %zd bytes\n", getpid(), rlen);
+
+    // Extract request line
+    char request_line[1024];
+    char *line_end = strstr(req_buf, "\r\n");
+    if (!line_end) line_end = strstr(req_buf, "\n");
+    
+    if (line_end) {
+        size_t line_len = line_end - req_buf;
+        if (line_len >= sizeof(request_line)) 
+            line_len = sizeof(request_line) - 1;
+        strncpy(request_line, req_buf, line_len);
+        request_line[line_len] = '\0';
+    } else {
+        printf("[CHILD PID=%d] No request line found.\n", getpid());
+        send_400(client_socket);
+        return;
+    }
+
+    // Parse request line
+    char method[16], path[1024], version[16];
+    int scanned = sscanf(request_line, "%15s %1023s %15s", method, path, version);
+    
+    if (scanned != 3) {
+        send_400(client_socket);
+        return;
+    }
+
+    printf("[CHILD PID=%d] Request: %s %s %s\n", getpid(), method, path, version);
+
+    // Only handle GET requests
+    if (strcmp(method, "GET") != 0) {
+        const char *not_impl = "HTTP/1.1 501 Not Implemented\r\n"
+                              "Content-Type: text/html\r\n"
+                              "Content-Length: 70\r\n"
+                              "Connection: close\r\n\r\n"
+                              "<html><body><h1>501 Not Implemented</h1>"
+                              "<p>Method not supported.</p></body></html>";
+        send(client_socket, not_impl, strlen(not_impl), 0);
+        printf("[CHILD PID=%d] Sent 501 Not Implemented (method %s)\n", getpid(), method);
+        return;
+    }
+
+    // Sanitize URL
+    int sanitize_result = sanitize_url(path);
+    printf("[CHILD PID=%d] Sanitize result: %d\n", getpid(), sanitize_result);
+    
+    if (!sanitize_result) {
+        printf("[CHILD PID=%d] URL failed sanitization: %s\n", getpid(), path);
+        send_400(client_socket);
+        return;
+    }
+
+    printf("[CHILD PID=%d] Sanitized path: %s\n", getpid(), path);
+
+    // Build file path
+    char file_path[2048];
+    build_file_path(root_dir, path, file_path, sizeof(file_path));
+    
+    // Check if file is readable
+    if (!is_file_readable(file_path)) {
+        printf("[CHILD PID=%d] File not readable or not found: %s\n", getpid(), file_path);
+        
+        // Determine if it's 403 or 404
+        struct stat st;
+        if (stat(file_path, &st) == 0) {
+            send_403(client_socket, path);
+        } else {
+            send_404(client_socket, path);
+        }
+        return;
+    }
+
+    // Send the file
+    if (!send_file(client_socket, file_path, path)) {
+        send_404(client_socket, path);
+    }
 }
 
 // Validate that root directory exists and is accessible
@@ -243,7 +332,7 @@ int build_file_path(const char *root, const char *req_path, char *file_path, siz
             temp_path[sizeof(temp_path) - 1] = '\0';
             
             snprintf(file_path, max_len, "%s/index.html", temp_path);
-            printf("Directory detected, serving: %s\n", file_path);
+            printf("[PID=%d] Directory detected, serving: %s\n", getpid(), file_path);
         }
     }
     
@@ -304,7 +393,7 @@ void normalize_path(char *path) {
 int send_file(int socket, const char *file_path, const char *req_path) {
     FILE *file = fopen(file_path, "rb");
     if (!file) {
-        printf("File not found: %s\n", file_path);
+        printf("[PID=%d] File not found: %s\n", getpid(), file_path);
         return 0;
     }
 
@@ -336,22 +425,21 @@ int send_file(int socket, const char *file_path, const char *req_path) {
     }
 
     fclose(file);
-    printf("Sent 200 OK: %s (%ld bytes, %s)\n", req_path, total_sent, mime_type);
+    printf("[PID=%d] Sent 200 OK: %s (%ld bytes, %s)\n", 
+           getpid(), req_path, total_sent, mime_type);
     return 1;
 }
-
-// ==================== NEW SECURITY FUNCTIONS ====================
 
 // Strip query strings (?param=value) and fragments (#anchor)
 void strip_query_and_fragment(char *url) {
     char *query = strchr(url, '?');
     if (query) {
-        *query = '\0';  // Terminate at '?'
+        *query = '\0';
     }
     
     char *fragment = strchr(url, '#');
     if (fragment) {
-        *fragment = '\0';  // Terminate at '#'
+        *fragment = '\0';
     }
 }
 
@@ -360,13 +448,12 @@ int validate_url_characters(const char *url) {
     for (const char *p = url; *p != '\0'; p++) {
         char c = *p;
         
-        // Allow: alphanumeric, slash, dot, hyphen, underscore, percent (for encoding)
         if (isalnum(c) || c == '/' || c == '.' || c == '-' || c == '_' || c == '%') {
             continue;
         }
         
-        // Reject any other character
-        printf("Invalid character in URL: '%c' (0x%02x)\n", c, (unsigned char)c);
+        printf("[PID=%d] Invalid character in URL: '%c' (0x%02x)\n", 
+               getpid(), c, (unsigned char)c);
         return 0;
     }
     return 1;
@@ -374,60 +461,53 @@ int validate_url_characters(const char *url) {
 
 // Check for path traversal attempts (../)
 int contains_path_traversal(const char *path) {
-    printf("  [Security] Checking path traversal for: '%s'\n", path);
+    printf("[PID=%d]   [Security] Checking path traversal for: '%s'\n", getpid(), path);
     
-    // Check for literal "../" or "/.."
     if (strstr(path, "../") != NULL) {
-        printf("  [Security] BLOCKED: Found '../' in path\n");
+        printf("[PID=%d]   [Security] BLOCKED: Found '../' in path\n", getpid());
         return 1;
     }
     
     if (strstr(path, "/..") != NULL) {
-        printf("  [Security] BLOCKED: Found '/..' in path\n");
+        printf("[PID=%d]   [Security] BLOCKED: Found '/..' in path\n", getpid());
         return 1;
     }
     
-    // Check if path equals ".."
     if (strcmp(path, "..") == 0) {
-        printf("  [Security] BLOCKED: Path is '..'\n");
+        printf("[PID=%d]   [Security] BLOCKED: Path is '..'\n", getpid());
         return 1;
     }
     
-    printf("  [Security] Path traversal check: PASSED\n");
+    printf("[PID=%d]   [Security] Path traversal check: PASSED\n", getpid());
     return 0;
 }
 
 // Check if file exists and is readable
 int is_file_readable(const char *path) {
-    // Use access() to check if file is readable
     if (access(path, R_OK) == 0) {
-        return 1;  // File is readable
+        return 1;
     }
-    return 0;  // File doesn't exist or isn't readable
+    return 0;
 }
 
 // Main URL sanitization function
 int sanitize_url(char *url) {
-    printf("Original URL: %s\n", url);
+    printf("[PID=%d] Original URL: %s\n", getpid(), url);
     
-    // Step 1: Strip query strings and fragments
     strip_query_and_fragment(url);
-    printf("After stripping query/fragment: %s\n", url);
+    printf("[PID=%d] After stripping query/fragment: %s\n", getpid(), url);
     
-    // Step 2: Check for path traversal
     if (contains_path_traversal(url)) {
-        return 0;  // Reject
+        return 0;
     }
     
-    // Step 3: Validate characters
     if (!validate_url_characters(url)) {
-        return 0;  // Reject
+        return 0;
     }
     
-    // Step 4: Normalize path (remove duplicate slashes)
     normalize_path(url);
     
-    return 1;  // URL is safe
+    return 1;
 }
 
 // Send 404 Not Found response
@@ -442,7 +522,7 @@ void send_404(int socket, const char *path) {
                       "Connection: close\r\n\r\n%s",
                       strlen(body), body);
     send(socket, response, len, 0);
-    printf("Sent 404 Not Found: %s\n", path);
+    printf("[PID=%d] Sent 404 Not Found: %s\n", getpid(), path);
 }
 
 // Send 403 Forbidden response
@@ -457,7 +537,7 @@ void send_403(int socket, const char *path) {
                       "Connection: close\r\n\r\n%s",
                       strlen(body), body);
     send(socket, response, len, 0);
-    printf("Sent 403 Forbidden: %s\n", path);
+    printf("[PID=%d] Sent 403 Forbidden: %s\n", getpid(), path);
 }
 
 // Send 400 Bad Request response
@@ -472,5 +552,5 @@ void send_400(int socket) {
                       "Connection: close\r\n\r\n%s",
                       strlen(body), body);
     send(socket, response, len, 0);
-    printf("Sent 400 Bad Request\n");
+    printf("[PID=%d] Sent 400 Bad Request\n", getpid());
 }
