@@ -139,6 +139,58 @@ int is_file_readable(const char *path) {
     }
     return 0;  // File doesn't exist or isn't readable
 }
+// Check if path is a directory
+int is_directory(const char *path) {
+    struct stat path_stat;
+    if (stat(path, &path_stat) != 0) {
+        return 0;
+    }
+    return S_ISDIR(path_stat.st_mode);
+}
+
+
+// Build the complete file path from root and requested path
+int build_file_path(const char *root, const char *req_path, char *file_path, size_t max_len) {
+    // Start with root directory (without trailing slash)
+    size_t root_len = strlen(root);
+    char root_clean[4096];
+    strncpy(root_clean, root, sizeof(root_clean) - 1);
+    root_clean[sizeof(root_clean) - 1] = '\0';
+    
+    if (root_len > 0 && root_clean[root_len - 1] == '/') {
+        root_clean[root_len - 1] = '\0';
+    }
+    
+    // Handle root path
+    if (strcmp(req_path, "/") == 0) {
+        snprintf(file_path, max_len, "%s/index.html", root_clean);
+    } else {
+        // Construct path: root + requested path
+        snprintf(file_path, max_len, "%s%s", root_clean, req_path);
+        
+        // Check if this path is a directory
+        if (is_directory(file_path)) {
+            // If it's a directory, append /index.html
+            size_t current_len = strlen(file_path);
+            
+            // Remove trailing slash if present before appending index.html
+            if (current_len > 0 && file_path[current_len - 1] == '/') {
+                file_path[current_len - 1] = '\0';
+                current_len--;
+            }
+            
+            // Use a temporary buffer to avoid overwriting while reading
+            char temp_path[4096];
+            strncpy(temp_path, file_path, sizeof(temp_path) - 1);
+            temp_path[sizeof(temp_path) - 1] = '\0';
+            
+            snprintf(file_path, max_len, "%s/index.html", temp_path);
+            printf("[FILE] Directory detected, serving: %s\n", file_path);
+        }
+    }
+    
+    return 1;
+}
 
 // Main URL sanitization function
 int sanitize_url(char *url) {
@@ -452,18 +504,9 @@ int main() {
                     } else {
                         char full_path[512];
                         
-                        // Handle root path
-                        if (strcmp(path, "/") == 0) {
-                            snprintf(full_path, sizeof(full_path), "./www/index.html");
-                        }
-                        // Handle directory paths (ending with /)
-                        else if (path[strlen(path) - 1] == '/') {
-                            snprintf(full_path, sizeof(full_path), "./www%sindex.html", path);
-                        }
-                        // Handle file paths
-                        else {
-                            snprintf(full_path, sizeof(full_path), "./www%s", path);
-                        }
+                            // Use the build_file_path function for proper nested directory handling
+                        build_file_path("./www", path, full_path, sizeof(full_path));
+
                         
                         printf("[FILE] Constructed file path: %s\n", full_path);
                         
